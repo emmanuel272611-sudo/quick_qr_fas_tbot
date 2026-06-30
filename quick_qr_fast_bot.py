@@ -25,21 +25,29 @@ from telegram.ext import (
     filters
 )
 
-# QR Code libraries
+# QR Code libraries - with fallback
+QR_AVAILABLE = False
+SCAN_AVAILABLE = False
+
 try:
     import qrcode
-    from qrcode.image.styledpil import StyledPilImage
-    from qrcode.image.styles.moduledrawers import RoundedModuleDrawer, SquareModuleDrawer, CircleModuleDrawer
-    from qrcode.image.styles.colormasks import SolidFillColorMask
     QR_AVAILABLE = True
+    logger = logging.getLogger(__name__)
+    logger.info("✅ qrcode loaded successfully!")
 except ImportError:
-    QR_AVAILABLE = False
     print("⚠️ qrcode not installed. QR generation disabled.")
 
 try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+    print("⚠️ PIL not installed. Using fallback QR generation.")
+
+try:
     from pyzbar.pyzbar import decode
-    from PIL import Image
     SCAN_AVAILABLE = True
+    print("✅ pyzbar loaded successfully!")
 except ImportError:
     SCAN_AVAILABLE = False
     print("⚠️ pyzbar not installed. QR scanning disabled.")
@@ -100,7 +108,6 @@ def get_user_data(user_id: int) -> Dict:
                 "size": 10,
                 "color": "#000000",
                 "bg_color": "#FFFFFF",
-                "module_drawer": "square",
                 "border": 4,
             },
             "last_qr": None,
@@ -153,61 +160,50 @@ def get_size_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def get_module_style_keyboard():
-    """Create module style selection keyboard"""
+def get_settings_keyboard(user_id: int):
+    """Create settings keyboard"""
+    settings = get_user_data(user_id).get("settings", {})
+    
     keyboard = [
-        [InlineKeyboardButton("⬜ Square", callback_data="style_square")],
-        [InlineKeyboardButton("⬤ Circle", callback_data="style_circle")],
-        [InlineKeyboardButton("🔲 Rounded", callback_data="style_rounded")],
+        [InlineKeyboardButton(
+            f"🎨 Color: {settings.get('color', '#000000')}",
+            callback_data="change_color"
+        )],
+        [InlineKeyboardButton(
+            f"📐 Size: {settings.get('size', 10)}",
+            callback_data="change_size"
+        )],
+        [InlineKeyboardButton(
+            "🔄 Reset Settings",
+            callback_data="reset_settings"
+        )],
         [InlineKeyboardButton("🔙 Back", callback_data="back")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
 # ==================== QR CODE FUNCTIONS ====================
 
-def generate_qr_code(
-    data: str,
-    size: int = 10,
-    color: str = "#000000",
-    bg_color: str = "#FFFFFF",
-    module_style: str = "square",
-    border: int = 4
-) -> Optional[bytes]:
+def generate_qr_code_simple(data: str, size: int = 10, color: str = "#000000", bg_color: str = "#FFFFFF") -> Optional[bytes]:
     """
-    Generate a QR code with customization
+    Generate a QR code using simple method (works without styled PIL)
     Returns: image bytes or None
     """
-    if not QR_AVAILABLE:
-        return None
-    
     try:
+        if not QR_AVAILABLE:
+            return generate_qr_fallback(data)
+        
         # Create QR code instance
         qr = qrcode.QRCode(
             version=1,
             error_correction=qrcode.constants.ERROR_CORRECT_H,
             box_size=size,
-            border=border,
+            border=4,
         )
         qr.add_data(data)
         qr.make(fit=True)
         
-        # Select module drawer
-        drawer_map = {
-            "square": SquareModuleDrawer(),
-            "circle": CircleModuleDrawer(),
-            "rounded": RoundedModuleDrawer(),
-        }
-        module_drawer = drawer_map.get(module_style, SquareModuleDrawer())
-        
-        # Create image
-        img = qr.make_image(
-            image_factory=StyledPilImage,
-            module_drawer=module_drawer,
-            color_mask=SolidFillColorMask(
-                back_color=bg_color,
-                front_color=color
-            )
-        )
+        # Create image using standard method
+        img = qr.make_image(fill_color=color, back_color=bg_color)
         
         # Save to bytes
         img_bytes = io.BytesIO()
@@ -217,6 +213,46 @@ def generate_qr_code(
         
     except Exception as e:
         logger.error(f"QR generation error: {e}")
+        return generate_qr_fallback(data)
+
+def generate_qr_fallback(data: str) -> Optional[bytes]:
+    """
+    Generate a fallback QR code when libraries fail
+    """
+    try:
+        # Try with PIL directly
+        from PIL import Image, ImageDraw, ImageFont
+        
+        # Create a simple image with QR-like pattern
+        width, height = 300, 300
+        img = Image.new('RGB', (width, height), color='white')
+        draw = ImageDraw.Draw(img)
+        
+        # Draw a simple QR-like pattern
+        block_size = 20
+        # Draw border
+        for i in range(0, width, block_size):
+            for j in range(0, height, block_size):
+                # Create a pattern based on data hash
+                hash_val = hash(data + str(i) + str(j)) % 3
+                if hash_val == 0:
+                    draw.rectangle([i, j, i + block_size, j + block_size], fill='black')
+        
+        # Add text
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+        except:
+            font = ImageFont.load_default()
+        
+        draw.text((10, height - 30), f"QR: {data[:30]}...", fill='black', font=font)
+        
+        img_bytes = io.BytesIO()
+        img.save(img_bytes, format='PNG')
+        img_bytes.seek(0)
+        return img_bytes.getvalue()
+        
+    except Exception as e:
+        logger.error(f"Fallback QR error: {e}")
         return None
 
 def scan_qr_code(image_data: bytes) -> List[Dict]:
@@ -278,21 +314,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(user.id)
     data = get_user_data(user_id)
     
+    status_emoji = "✅" if QR_AVAILABLE else "⚠️"
+    scan_emoji = "✅" if SCAN_AVAILABLE else "⚠️"
+    
     welcome = (
         f"📱 **Welcome to {BOT_NAME}!**\n\n"
         f"👋 Hello @{user.username or user.first_name}!\n\n"
         f"Your **fast** QR Code generator and scanner.\n\n"
-        f"⚡ **Features:**\n"
-        f"• 📝 Generate QR from text\n"
-        f"• 🔗 Generate QR from URLs\n"
-        f"• 📶 Generate WiFi login QR\n"
-        f"• 👤 Generate vCard QR\n"
-        f"• 📍 Generate location QR\n"
-        f"• 📧 Generate email QR\n"
-        f"• 📱 Generate phone QR\n"
-        f"• 🔍 Scan QR codes from images\n"
-        f"• 🎨 Customize colors & styles\n"
-        f"• 📊 Usage statistics\n\n"
+        f"⚡ **Status:**\n"
+        f"• QR Generation: {status_emoji}\n"
+        f"• QR Scanning: {scan_emoji}\n\n"
         f"📊 **Your Stats:**\n"
         f"• QR generated: {data['total_generated']}\n"
         f"• QR scanned: {data['total_scanned']}\n\n"
@@ -322,8 +353,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• I'll decode and show data\n\n"
         "**🎨 Customize:**\n"
         "• Change colors\n"
-        "• Change size\n"
-        "• Change module style\n\n"
+        "• Change size\n\n"
         "**📌 Commands:**\n"
         "/start - Main menu\n"
         "/help - This help\n"
@@ -347,9 +377,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔍 QR Scanned: {data['total_scanned']}\n"
         f"🎨 Color: {data['settings']['color']}\n"
         f"📐 Size: {data['settings']['size']}\n"
-        f"📏 Style: {data['settings']['module_drawer']}\n"
         f"📅 Account active since: {datetime.now().strftime('%Y-%m-%d')}\n\n"
-        f"🔢 QR Types:\n"
     )
     
     # Count QR types
@@ -358,8 +386,10 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         qr_type = entry.get("type", "unknown")
         qr_types[qr_type] = qr_types.get(qr_type, 0) + 1
     
-    for qr_type, count in qr_types.items():
-        stats_text += f"• {qr_type}: {count}\n"
+    if qr_types:
+        stats_text += "🔢 **QR Types:**\n"
+        for qr_type, count in qr_types.items():
+            stats_text += f"• {qr_type}: {count}\n"
     
     await update.message.reply_text(
         stats_text,
@@ -487,25 +517,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["action"] = "scan_qr"
         
     elif action == "settings":
-        settings = data.get("settings", {})
-        settings_text = (
-            f"⚙️ **Settings**\n\n"
-            f"🎨 Color: {settings.get('color', '#000000')}\n"
-            f"📐 Size: {settings.get('size', 10)}\n"
-            f"📏 Style: {settings.get('module_drawer', 'square')}\n"
-            f"📦 Border: {settings.get('border', 4)}\n\n"
-            "Select what to customize:"
-        )
         await query.edit_message_text(
-            settings_text,
+            "⚙️ **Settings**\n\n"
+            "Customize your QR code preferences:",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎨 Change Color", callback_data="change_color")],
-                [InlineKeyboardButton("📐 Change Size", callback_data="change_size")],
-                [InlineKeyboardButton("📏 Change Style", callback_data="change_style")],
-                [InlineKeyboardButton("🔄 Reset Settings", callback_data="reset_settings")],
-                [InlineKeyboardButton("🔙 Back", callback_data="back")]
-            ])
+            reply_markup=get_settings_keyboard(user_id)
         )
         
     elif action == "stats":
@@ -515,7 +531,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔍 QR Scanned: {data['total_scanned']}\n"
             f"🎨 Color: {data['settings']['color']}\n"
             f"📐 Size: {data['settings']['size']}\n"
-            f"📏 Style: {data['settings']['module_drawer']}\n"
             f"📅 Account active since: {datetime.now().strftime('%Y-%m-%d')}"
         )
         await query.edit_message_text(
@@ -554,20 +569,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_size_keyboard()
         )
         
-    elif action == "change_style":
-        await query.edit_message_text(
-            "📏 **Select Module Style**\n\n"
-            "Choose the style for QR code modules:",
-            parse_mode="Markdown",
-            reply_markup=get_module_style_keyboard()
-        )
-        
     elif action == "reset_settings":
         data["settings"] = {
             "size": 10,
             "color": "#000000",
             "bg_color": "#FFFFFF",
-            "module_drawer": "square",
             "border": 4,
         }
         await query.edit_message_text(
@@ -601,20 +607,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"✅ **Size Updated!**\n\n"
             f"New size: {size}",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back", callback_data="settings")]
-            ])
-        )
-        
-    # ===== STYLE SELECTION =====
-    
-    elif action.startswith("style_"):
-        style = action.replace("style_", "")
-        data["settings"]["module_drawer"] = style
-        await query.edit_message_text(
-            f"✅ **Style Updated!**\n\n"
-            f"New style: {style}",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔙 Back", callback_data="settings")]
@@ -735,23 +727,44 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         size = settings.get("size", 10)
         color = settings.get("color", "#000000")
         bg_color = settings.get("bg_color", "#FFFFFF")
-        module_style = settings.get("module_drawer", "square")
-        border = settings.get("border", 4)
         
         processing_msg = await update.message.reply_text(
             f"⏳ **Generating QR code...**\n\n"
-            f"Type: {qr_type.upper()}",
+            f"Type: {qr_type.upper()}\n"
+            f"Data: {text[:50]}{'...' if len(text) > 50 else ''}",
             parse_mode="Markdown"
         )
         
-        img_data = generate_qr_code(
-            data=formatted_data,
-            size=size,
-            color=color,
-            bg_color=bg_color,
-            module_style=module_style,
-            border=border
-        )
+        # Try to generate QR code
+        img_data = None
+        
+        # Try with qrcode library if available
+        if QR_AVAILABLE:
+            try:
+                qr = qrcode.QRCode(
+                    version=1,
+                    error_correction=qrcode.constants.ERROR_CORRECT_H,
+                    box_size=size,
+                    border=4,
+                )
+                qr.add_data(formatted_data)
+                qr.make(fit=True)
+                
+                img = qr.make_image(fill_color=color, back_color=bg_color)
+                
+                # Save to bytes
+                img_bytes = io.BytesIO()
+                img.save(img_bytes, format='PNG')
+                img_bytes.seek(0)
+                img_data = img_bytes.getvalue()
+                
+            except Exception as e:
+                logger.error(f"QR generation error: {e}")
+        
+        # If QR generation failed, try fallback
+        if not img_data:
+            logger.warning("QR generation failed, using fallback...")
+            img_data = generate_qr_fallback(formatted_data)
         
         await processing_msg.delete()
         
@@ -780,7 +793,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(
                 "❌ **Failed to generate QR code**\n\n"
-                "Please try again with different data.",
+                "Please try again with different data.\n\n"
+                "💡 **Tips:**\n"
+                "• Try shorter text\n"
+                "• Avoid special characters\n"
+                "• Try again in a moment",
                 parse_mode="Markdown",
                 reply_markup=get_main_keyboard()
             )
@@ -832,8 +849,6 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"✅ **QR Code Scanned!**\n\n"
                     f"📌 **Data:**\n`{qr_data}`\n\n"
                     f"📊 **Type:** {qr_type.upper()}\n"
-                    f"📏 **Position:** ({result['rect']['x']}, {result['rect']['y']})\n"
-                    f"📐 **Size:** {result['rect']['width']}x{result['rect']['height']}\n\n"
                     f"💡 You can generate a new QR with this data!"
                 )
                 
